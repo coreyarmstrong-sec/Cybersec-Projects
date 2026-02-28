@@ -1,0 +1,971 @@
+#!/usr/bin/env python3
+"""
+=============================================================================
+  PHISHING EMAIL DETECTOR
+  Multi-Layer Analysis Engine for Suspicious Emails
+=============================================================================
+  Author  : Saint (github.com/saint-sec)
+  Purpose : Analyze .eml email files for phishing indicators using header
+            analysis, URL inspection, content scoring, and sender validation.
+
+  INPUT:  .eml files (standard email format — export from any mail client)
+  OUTPUT: Structured risk report with score, verdict, and detailed findings
+
+  HOW PHISHING WORKS (so you understand what we're detecting):
+    1. Spoofed sender — display name says "PayPal" but domain is paypa1.com
+    2. Urgency tactics — "Your account will be closed in 24 hours!"
+    3. Malicious URLs — look like real sites but redirect to credential harvesters
+    4. Failed auth checks — no SPF/DKIM/DMARC = not from the real domain
+    5. Suspicious attachments — .exe, .zip, .iso, .js hidden as invoices
+=============================================================================
+"""
+
+import os
+import sys
+import re
+import json
+import email
+import email.policy
+import argparse
+import datetime
+import urllib.parse
+import base64
+import quopri
+from email.header import decode_header
+from collections import defaultdict
+from pathlib import Path
+
+# ── Optional dependencies ────────────────────────────────────────────────────
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+
+
+# ── Threat Intelligence Data ─────────────────────────────────────────────────
+
+# Known URL shortener services — commonly abused to hide malicious destinations
+URL_SHORTENERS = {
+    'bit.ly', 'tinyurl.com', 'goo.gl', 'ow.ly', 't.co', 'buff.ly',
+    'short.link', 'tiny.cc', 'rb.gy', 'cutt.ly', 'is.gd', 'v.gd',
+    'shorte.st', 'adf.ly', 'bc.vc', 'linktr.ee', 'snipurl.com',
+}
+
+# Free hosting domains commonly used for phishing pages
+SUSPICIOUS_HOSTING = {
+    'sites.google.com', 'pages.github.io', 'web.app', 'firebaseapp.com',
+    'netlify.app', 'vercel.app', 'glitch.me', 'repl.co', 'replit.dev',
+    'onrender.com', '000webhostapp.com', 'weebly.com', 'wixsite.com',
+    'sharepoint.com', 'blob.core.windows.net', 's3.amazonaws.com',
+}
+
+# High-risk TLDs frequently used in phishing campaigns (not exclusively malicious)
+HIGH_RISK_TLDS = {
+    '.xyz', '.top', '.club', '.work', '.click', '.link', '.bid',
+    '.loan', '.win', '.gq', '.cf', '.ml', '.ga', '.tk', '.pw',
+    '.icu', '.rest', '.live', '.online', '.site', '.website',
+}
+
+# Popular brands frequently targeted in phishing (for spoof detection)
+IMPERSONATED_BRANDS = {
+    'paypal', 'microsoft', 'apple', 'amazon', 'google', 'netflix',
+    'facebook', 'instagram', 'twitter', 'linkedin', 'dropbox',
+    'chase', 'wellsfargo', 'bankofamerica', 'citibank', 'usbank',
+    'irs', 'fedex', 'ups', 'dhl', 'usps', 'docusign', 'adobe',
+    'zoom', 'teams', 'office365', 'outlook', 'icloud', 'yahoo',
+}
+
+# Urgency and social engineering keywords — red flags in email body
+URGENCY_KEYWORDS = [
+    'verify your account', 'confirm your identity', 'suspicious activity',
+    'unauthorized access', 'account suspended', 'account locked',
+    'click here immediately', 'act now', 'within 24 hours', 'expire',
+    'urgent', 'immediately', 'your account will be', 'verify now',
+    'action required', 'security alert', 'limited time', 'unusual sign-in',
+    'billing problem', 'payment failed', 'update your payment',
+    'confirm your email', 'validate your account', 'click to verify',
+    'one-time password', 'temporary password', 'reset your password',
+]
+
+# Credential harvesting keywords
+CREDENTIAL_KEYWORDS = [
+    'enter your password', 'provide your credentials', 'login below',
+    'sign in to continue', 'username and password', 'social security',
+    'credit card number', 'bank account', 'routing number',
+    'date of birth', 'mother maiden name', 'security question',
+]
+
+# Dangerous attachment extensions
+DANGEROUS_EXTENSIONS = {
+    '.exe', '.dll', '.bat', '.cmd', '.vbs', '.js', '.jse', '.wsf',
+    '.wsh', '.ps1', '.psm1', '.psd1', '.hta', '.scr', '.pif', '.reg',
+    '.iso', '.img', '.lnk', '.msi', '.msp', '.mst', '.jar', '.class',
+    '.docm', '.xlsm', '.pptm', '.dotm',  # macro-enabled Office
+    '.rar', '.7z',                         # archives used to bypass AV
+}
+
+# Suspicious subject line patterns
+SUSPICIOUS_SUBJECTS = [
+    r'(?:re|fwd):\s*(?:re|fwd):',    # excessive reply chains (spoofing)
+    r'\[external\].*urgent',          # external tag + urgency
+    r'(?:your|account|invoice|payment|order).*(?:suspended|blocked|limited|failed)',
+    r'(?:verify|confirm|update|validate).*(?:account|email|identity|information)',
+    r'(?:action|response).*required',
+    r'important.*(?:notice|update|security)',
+    r'(?:final|last).*(?:warning|notice|chance)',
+    r'(?:unauthorized|suspicious).*(?:access|activity|login|sign.?in)',
+    r'your.*(?:account|password|access).*(?:expires?|will be|about to)',
+]
+
+
+# ── Email Parsing ────────────────────────────────────────────────────────────
+
+def parse_email_file(filepath: str) -> email.message.Message:
+    """Parse a .eml file into a Python email Message object."""
+    with open(filepath, 'rb') as f:
+        msg = email.message_from_bytes(f.read(), policy=email.policy.default)
+    return msg
+
+
+def decode_email_header(header_value: str) -> str:
+    """
+    Decode encoded email headers (Base64/QP encoded subjects, sender names).
+    
+    WHY: Email headers can be encoded to support non-ASCII characters.
+    Phishers sometimes use this to hide display names or confuse parsers.
+    Example: =?UTF-8?B?UGF5UGFsU2VjdXJpdHk=?= decodes to "PayPalSecurity"
+    """
+    if not header_value:
+        return ''
+    
+    decoded_parts = decode_header(header_value)
+    result = []
+    for part, encoding in decoded_parts:
+        if isinstance(part, bytes):
+            try:
+                result.append(part.decode(encoding or 'utf-8', errors='replace'))
+            except (LookupError, UnicodeDecodeError):
+                result.append(part.decode('utf-8', errors='replace'))
+        else:
+            result.append(str(part))
+    return ' '.join(result)
+
+
+def extract_email_body(msg: email.message.Message) -> dict:
+    """
+    Extract plaintext and HTML body from a multipart email.
+    
+    WHY: Phishing emails often have a benign plaintext part and malicious HTML.
+    We analyze both. HTML body may contain hidden links with misleading text.
+    """
+    plain_body = ''
+    html_body = ''
+    
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            content_disposition = str(part.get('Content-Disposition', ''))
+            
+            if 'attachment' in content_disposition:
+                continue
+            
+            if content_type == 'text/plain':
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or 'utf-8'
+                    plain_body += payload.decode(charset, errors='replace')
+            
+            elif content_type == 'text/html':
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or 'utf-8'
+                    html_body += payload.decode(charset, errors='replace')
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or 'utf-8'
+            content = payload.decode(charset, errors='replace')
+            if msg.get_content_type() == 'text/html':
+                html_body = content
+            else:
+                plain_body = content
+    
+    return {'plain': plain_body, 'html': html_body}
+
+
+def extract_attachments(msg: email.message.Message) -> list:
+    """Extract attachment metadata (does NOT save files — just inspects names/types)."""
+    attachments = []
+    
+    for part in msg.walk():
+        content_disposition = str(part.get('Content-Disposition', ''))
+        
+        if 'attachment' in content_disposition:
+            filename = part.get_filename()
+            if filename:
+                filename = decode_email_header(filename)
+                ext = os.path.splitext(filename.lower())[1]
+                
+                attachments.append({
+                    'filename':    filename,
+                    'extension':   ext,
+                    'content_type': part.get_content_type(),
+                    'dangerous':   ext in DANGEROUS_EXTENSIONS,
+                    'size_bytes':  len(part.get_payload(decode=True) or b''),
+                })
+    
+    return attachments
+
+
+# ── Header Analysis ──────────────────────────────────────────────────────────
+
+def analyze_sender(msg: email.message.Message) -> dict:
+    """
+    Analyze From, Reply-To, and Return-Path headers for spoofing.
+    
+    SPOOFING TECHNIQUES:
+    1. Display name says "PayPal" but email is paypal@evil.com
+    2. From: PayPal <service@paypal.com> but Reply-To: attacker@evil.com
+    3. Domain lookalikes: paypa1.com, paypal.security-update.com
+    4. Subdomain abuse: paypal.com.phish.net (TLD is phish.net, not paypal.com)
+    """
+    result = {}
+    
+    # ── Parse From header ────────────────────────────────────────────────
+    from_header = decode_email_header(msg.get('From', ''))
+    result['from_raw'] = from_header
+    
+    # Extract display name and email address
+    display_name_match = re.match(r'^(.*?)\s*<(.+?)>', from_header)
+    if display_name_match:
+        result['from_display_name'] = display_name_match.group(1).strip().strip('"')
+        result['from_email'] = display_name_match.group(2).strip()
+    else:
+        result['from_display_name'] = ''
+        result['from_email'] = from_header.strip()
+    
+    # Extract domain
+    email_addr = result['from_email']
+    domain_match = re.search(r'@([\w.-]+)', email_addr)
+    result['from_domain'] = domain_match.group(1).lower() if domain_match else ''
+    
+    # ── Reply-To mismatch ────────────────────────────────────────────────
+    reply_to = decode_email_header(msg.get('Reply-To', ''))
+    result['reply_to'] = reply_to
+    
+    if reply_to and result['from_email']:
+        reply_domain_match = re.search(r'@([\w.-]+)', reply_to)
+        reply_domain = reply_domain_match.group(1).lower() if reply_domain_match else ''
+        
+        result['reply_to_mismatch'] = (
+            reply_domain != '' and 
+            reply_domain != result['from_domain']
+        )
+    else:
+        result['reply_to_mismatch'] = False
+    
+    # ── Return-Path mismatch ─────────────────────────────────────────────
+    return_path = msg.get('Return-Path', '')
+    result['return_path'] = return_path
+    rp_domain_match = re.search(r'@([\w.-]+)', return_path)
+    rp_domain = rp_domain_match.group(1).lower() if rp_domain_match else ''
+    result['return_path_mismatch'] = (
+        rp_domain != '' and rp_domain != result['from_domain']
+    )
+    
+    # ── Brand impersonation check ────────────────────────────────────────
+    display_lower = result['from_display_name'].lower()
+    from_domain_lower = result['from_domain'].lower()
+    
+    impersonation_flags = []
+    for brand in IMPERSONATED_BRANDS:
+        # Display name claims to be a brand, but domain doesn't match
+        if brand in display_lower and brand not in from_domain_lower:
+            impersonation_flags.append({
+                'brand':        brand,
+                'display_name': result['from_display_name'],
+                'actual_domain': result['from_domain'],
+                'type':         'display_name_spoof',
+            })
+        
+        # Domain lookalike: brand name in domain but it's not the real brand domain
+        # e.g., "paypal.security-notice.com" or "secure-paypal.com"
+        elif brand in from_domain_lower:
+            # Check if it's actually the real domain
+            real_domain = f'{brand}.com'  # simplified check
+            if not from_domain_lower.endswith(f'.{brand}.com') and \
+               from_domain_lower != real_domain:
+                impersonation_flags.append({
+                    'brand':        brand,
+                    'actual_domain': result['from_domain'],
+                    'type':         'domain_lookalike',
+                })
+    
+    result['impersonation_flags'] = impersonation_flags
+    
+    # ── Suspicious TLD on from domain ────────────────────────────────────
+    for tld in HIGH_RISK_TLDS:
+        if from_domain_lower.endswith(tld):
+            result['suspicious_sender_tld'] = tld
+            break
+    
+    return result
+
+
+def analyze_authentication_headers(msg: email.message.Message) -> dict:
+    """
+    Analyze SPF, DKIM, and DMARC authentication results.
+    
+    WHY AUTH MATTERS:
+    - SPF  (Sender Policy Framework) — did the email come from an authorized server?
+    - DKIM (DomainKeys Identified Mail) — is the email cryptographically signed?
+    - DMARC (Domain-based Message Auth) — what policy should receivers apply?
+    
+    A legitimate email from paypal.com will PASS all three.
+    A spoofed email will FAIL or be missing these checks.
+    
+    These appear in the "Authentication-Results" header added by receiving servers.
+    """
+    result = {
+        'spf':   {'result': 'not_found', 'details': ''},
+        'dkim':  {'result': 'not_found', 'details': ''},
+        'dmarc': {'result': 'not_found', 'details': ''},
+    }
+    
+    auth_results = msg.get('Authentication-Results', '')
+    auth_results += ' ' + msg.get('ARC-Authentication-Results', '')
+    auth_results = auth_results.lower()
+    
+    # SPF
+    spf_match = re.search(r'spf=(\w+)', auth_results)
+    if spf_match:
+        result['spf']['result'] = spf_match.group(1)
+        # Extract context: spf=fail (reason)
+        spf_context = re.search(r'spf=\w+\s*([^;]+)', auth_results)
+        if spf_context:
+            result['spf']['details'] = spf_context.group(1).strip()
+    
+    # DKIM
+    dkim_match = re.search(r'dkim=(\w+)', auth_results)
+    if dkim_match:
+        result['dkim']['result'] = dkim_match.group(1)
+        dkim_context = re.search(r'dkim=\w+\s*([^;]+)', auth_results)
+        if dkim_context:
+            result['dkim']['details'] = dkim_context.group(1).strip()
+    
+    # DMARC
+    dmarc_match = re.search(r'dmarc=(\w+)', auth_results)
+    if dmarc_match:
+        result['dmarc']['result'] = dmarc_match.group(1)
+    
+    # Interpret results
+    failures = []
+    for check, data in result.items():
+        r = data['result']
+        if r in ('fail', 'hardfail', 'softfail', 'none'):
+            failures.append(f'{check.upper()} {r.upper()}')
+        elif r == 'not_found':
+            failures.append(f'{check.upper()} header missing')
+    
+    result['failures'] = failures
+    result['all_pass'] = all(
+        v['result'] == 'pass' 
+        for v in result.values() 
+        if isinstance(v, dict) and 'result' in v
+    )
+    result['raw'] = msg.get('Authentication-Results', 'Not present')
+    
+    return result
+
+
+def analyze_routing_headers(msg: email.message.Message) -> dict:
+    """
+    Analyze Received headers to trace the email's routing path.
+    
+    WHY: The Received headers form a chain from sender to recipient.
+    The BOTTOM entry is the original sender's server.
+    Mismatches between the claimed sender domain and originating IP are suspicious.
+    Also checks for unusually long routing chains (could indicate proxy chains).
+    """
+    received_headers = msg.get_all('Received', [])
+    
+    servers = []
+    for header in received_headers:
+        # Extract IPs from received headers
+        ips = re.findall(r'\[(\d{1,3}(?:\.\d{1,3}){3})\]', header)
+        # Extract server names
+        from_match = re.search(r'from\s+([\w.-]+)', header, re.IGNORECASE)
+        by_match = re.search(r'by\s+([\w.-]+)', header, re.IGNORECASE)
+        
+        servers.append({
+            'from_server': from_match.group(1) if from_match else '',
+            'by_server':   by_match.group(1) if by_match else '',
+            'ips_found':   ips,
+            'raw':         header[:200],
+        })
+    
+    # Check for IP-only senders (no hostname = suspicious)
+    ip_only_senders = [
+        s for s in servers 
+        if s['ips_found'] and not s['from_server']
+    ]
+    
+    return {
+        'hop_count': len(received_headers),
+        'servers':   servers,
+        'ip_only_senders': len(ip_only_senders),
+        'suspicious_hop_count': len(received_headers) > 8,
+        'originating_ip': servers[-1]['ips_found'][0] if servers and servers[-1]['ips_found'] else '',
+    }
+
+
+# ── URL Analysis ─────────────────────────────────────────────────────────────
+
+def extract_urls_from_html(html: str) -> list:
+    """
+    Extract all URLs from HTML body — both visible and hidden.
+    
+    WHY: The visible link text often says "Click here to verify your account at PayPal"
+    but the actual href points to "http://evil-site.ru/phish". We extract the real URL.
+    """
+    urls = []
+    
+    # href URLs (actual destinations)
+    href_urls = re.findall(r'href=["\']([^"\'>\s]+)', html, re.IGNORECASE)
+    urls.extend(href_urls)
+    
+    # src URLs (images, scripts)
+    src_urls = re.findall(r'src=["\']([^"\'>\s]+)', html, re.IGNORECASE)
+    urls.extend(src_urls)
+    
+    # action URLs (forms — common in credential harvesting)
+    action_urls = re.findall(r'action=["\']([^"\'>\s]+)', html, re.IGNORECASE)
+    urls.extend(action_urls)
+    
+    # Raw URLs in text
+    text_urls = re.findall(r'https?://[^\s\'"<>]+', html, re.IGNORECASE)
+    urls.extend(text_urls)
+    
+    # Filter and clean
+    cleaned = []
+    for url in urls:
+        url = url.strip().rstrip(').,;')
+        if url.startswith('http') or url.startswith('//'):
+            cleaned.append(url)
+    
+    return list(set(cleaned))
+
+
+def analyze_url(url: str) -> dict:
+    """
+    Analyze a single URL for phishing indicators.
+    
+    Checks:
+    - URL shortener (hides real destination)
+    - IP address instead of domain name (avoids domain reputation)
+    - Suspicious TLD
+    - Free hosting platform
+    - Brand name in URL path/subdomain (spoofing)
+    - Excessive subdomains (e.g., paypal.com.login.evil.net)
+    - URL encoding / obfuscation
+    - HTTP (no TLS) for credential submission
+    """
+    result = {
+        'url': url,
+        'flags': [],
+        'risk_score': 0,
+    }
+    
+    try:
+        parsed = urllib.parse.urlparse(url)
+        netloc = parsed.netloc.lower()
+        path = parsed.path.lower()
+        
+        # Remove port from netloc for domain analysis
+        domain = netloc.split(':')[0]
+        
+        # ── IP address instead of domain ─────────────────────────────────
+        if re.match(r'^\d{1,3}(?:\.\d{1,3}){3}$', domain):
+            result['flags'].append('IP address used instead of domain')
+            result['risk_score'] += 25
+        
+        # ── URL shortener ────────────────────────────────────────────────
+        elif domain in URL_SHORTENERS:
+            result['flags'].append(f'URL shortener detected: {domain}')
+            result['risk_score'] += 20
+        
+        # ── Suspicious hosting ───────────────────────────────────────────
+        for host in SUSPICIOUS_HOSTING:
+            if domain.endswith(host):
+                result['flags'].append(f'Suspicious hosting: {host}')
+                result['risk_score'] += 15
+                break
+        
+        # ── High-risk TLD ────────────────────────────────────────────────
+        tld = '.' + domain.rsplit('.', 1)[-1] if '.' in domain else ''
+        if tld in HIGH_RISK_TLDS:
+            result['flags'].append(f'High-risk TLD: {tld}')
+            result['risk_score'] += 15
+        
+        # ── Excessive subdomains ─────────────────────────────────────────
+        # Phishers use: paypal.com.secure-login.phish.ru
+        # The real TLD is phish.ru, not paypal.com
+        domain_parts = domain.split('.')
+        if len(domain_parts) > 4:
+            result['flags'].append(f'Excessive subdomain depth: {len(domain_parts)} levels')
+            result['risk_score'] += 15
+        
+        # ── Brand name in subdomain/path ─────────────────────────────────
+        for brand in IMPERSONATED_BRANDS:
+            # Brand in subdomain but not the registrable domain
+            # e.g., "paypal.evil.com" — registrable domain is evil.com
+            if len(domain_parts) >= 3:
+                registrable_domain = '.'.join(domain_parts[-2:])
+                if brand in domain and brand not in registrable_domain:
+                    result['flags'].append(f'Brand "{brand}" in subdomain (possible spoof)')
+                    result['risk_score'] += 20
+                    break
+            # Brand only in URL path
+            if brand in path:
+                result['flags'].append(f'Brand "{brand}" referenced in URL path')
+                result['risk_score'] += 5
+        
+        # ── HTTP (no encryption) ─────────────────────────────────────────
+        if parsed.scheme == 'http':
+            result['flags'].append('HTTP (no TLS) — credentials sent in plaintext')
+            result['risk_score'] += 10
+        
+        # ── URL encoding/obfuscation ─────────────────────────────────────
+        decoded = urllib.parse.unquote(url)
+        if decoded != url:
+            result['flags'].append('URL contains percent-encoded characters')
+            result['risk_score'] += 5
+        
+        # Double encoding
+        if re.search(r'%25[0-9a-fA-F]{2}', url):
+            result['flags'].append('Double URL encoding detected')
+            result['risk_score'] += 10
+        
+        # ── Misleading TLD within domain ─────────────────────────────────
+        # paypal.com.login.net — user sees paypal.com but TLD is .net
+        if re.search(r'(?:' + '|'.join(IMPERSONATED_BRANDS) + r')\.com\.', domain):
+            result['flags'].append('Brand .com used as subdomain (very suspicious)')
+            result['risk_score'] += 30
+        
+        result['domain'] = domain
+        result['scheme'] = parsed.scheme
+        result['path'] = parsed.path
+        
+    except Exception as e:
+        result['flags'].append(f'URL parse error: {e}')
+    
+    return result
+
+
+def detect_misleading_links(html: str) -> list:
+    """
+    Find links where visible text suggests a different URL than the href.
+    
+    Classic phishing: <a href="http://evil.com">www.paypal.com</a>
+    The user sees "www.paypal.com" but clicks to evil.com.
+    """
+    misleading = []
+    
+    # Find all anchor tags with href and text content
+    links = re.findall(
+        r'<a[^>]+href=["\']([^"\'>\s]+)["\'][^>]*>(.*?)</a>',
+        html, re.IGNORECASE | re.DOTALL
+    )
+    
+    for href, text in links:
+        # Clean text content (remove HTML tags)
+        text_clean = re.sub(r'<[^>]+>', '', text).strip()
+        
+        # If text looks like a URL, compare with href
+        if re.match(r'https?://', text_clean) or re.match(r'www\.', text_clean):
+            text_domain_match = re.search(r'(?:https?://)?([^/\s]+)', text_clean)
+            href_domain_match = re.search(r'(?:https?://)?([^/\s]+)', href)
+            
+            if text_domain_match and href_domain_match:
+                text_domain = text_domain_match.group(1).lower()
+                href_domain = href_domain_match.group(1).lower()
+                
+                if text_domain != href_domain and not href_domain.endswith(text_domain):
+                    misleading.append({
+                        'visible_text': text_clean[:100],
+                        'actual_href':  href[:200],
+                        'text_domain':  text_domain,
+                        'href_domain':  href_domain,
+                    })
+    
+    return misleading
+
+
+# ── Content Analysis ─────────────────────────────────────────────────────────
+
+def analyze_subject(subject: str) -> dict:
+    """
+    Analyze the email subject line for social engineering patterns.
+    """
+    result = {
+        'subject': subject,
+        'flags': [],
+    }
+    
+    subject_lower = subject.lower()
+    
+    # Check suspicious patterns
+    for pattern in SUSPICIOUS_SUBJECTS:
+        if re.search(pattern, subject_lower):
+            result['flags'].append(f'Suspicious pattern: {pattern}')
+    
+    # All caps (creating urgency/alarm)
+    if subject.upper() == subject and len(subject) > 5:
+        result['flags'].append('Subject is all uppercase (urgency tactic)')
+    
+    # Excessive punctuation
+    if subject.count('!') >= 2:
+        result['flags'].append(f'Excessive exclamation marks ({subject.count("!")})')
+    
+    # RE:/FWD: chains (faking thread history)
+    re_count = len(re.findall(r'(?:re|fwd)\s*:', subject, re.IGNORECASE))
+    if re_count >= 2:
+        result['flags'].append(f'Multiple RE:/FWD: prefixes ({re_count}) — possible spoofed thread')
+    
+    return result
+
+
+def analyze_body_content(plain: str, html: str) -> dict:
+    """
+    Analyze email body for social engineering and phishing indicators.
+    """
+    combined = (plain + ' ' + html).lower()
+    result = {
+        'urgency_hits': [],
+        'credential_hits': [],
+        'has_forms': False,
+        'form_actions': [],
+    }
+    
+    # Urgency keywords
+    for keyword in URGENCY_KEYWORDS:
+        if keyword.lower() in combined:
+            result['urgency_hits'].append(keyword)
+    
+    # Credential harvesting keywords
+    for keyword in CREDENTIAL_KEYWORDS:
+        if keyword.lower() in combined:
+            result['credential_hits'].append(keyword)
+    
+    # Forms in HTML (credential harvesting mechanism)
+    if html:
+        forms = re.findall(r'<form[^>]*>', html, re.IGNORECASE)
+        result['has_forms'] = len(forms) > 0
+        result['form_count'] = len(forms)
+        
+        # Extract form action URLs
+        actions = re.findall(r'<form[^>]+action=["\']([^"\']+)', html, re.IGNORECASE)
+        result['form_actions'] = actions
+        
+        # Password input fields
+        password_fields = re.findall(
+            r'<input[^>]+type=["\']password["\']', html, re.IGNORECASE
+        )
+        result['password_fields'] = len(password_fields)
+        
+        # Hidden fields (can exfiltrate data silently)
+        hidden_fields = re.findall(
+            r'<input[^>]+type=["\']hidden["\']', html, re.IGNORECASE
+        )
+        result['hidden_fields_count'] = len(hidden_fields)
+    
+    return result
+
+
+# ── Risk Scoring ─────────────────────────────────────────────────────────────
+
+def calculate_phishing_score(analysis: dict) -> tuple:
+    """
+    Calculate overall phishing risk score (0-100).
+    
+    Scoring weights are based on statistical significance of each indicator:
+    - Authentication failures are the most reliable signals
+    - URL analysis catches credential harvesting infrastructure
+    - Content analysis catches social engineering
+    """
+    score = 0
+    reasons = []
+    
+    # ── Authentication failures ──────────────────────────────────────────
+    auth = analysis.get('authentication', {})
+    for check in ['spf', 'dkim', 'dmarc']:
+        result = auth.get(check, {}).get('result', 'not_found')
+        if result in ('fail', 'hardfail', 'softfail'):
+            score += 20
+            reasons.append(f'{check.upper()} FAIL — sender may not be who they claim')
+        elif result == 'none':
+            score += 8
+            reasons.append(f'{check.upper()} not configured on sender domain')
+        elif result == 'not_found':
+            score += 5
+            reasons.append(f'{check.upper()} check not found in headers')
+    
+    # ── Sender analysis ──────────────────────────────────────────────────
+    sender = analysis.get('sender_analysis', {})
+    
+    if sender.get('impersonation_flags'):
+        for flag in sender['impersonation_flags']:
+            if flag['type'] == 'display_name_spoof':
+                score += 25
+                reasons.append(
+                    f"Display name spoof: claims to be '{flag['display_name']}' "
+                    f"but sent from {flag['actual_domain']}"
+                )
+            elif flag['type'] == 'domain_lookalike':
+                score += 20
+                reasons.append(f"Domain lookalike: '{flag['actual_domain']}' impersonates {flag['brand']}")
+    
+    if sender.get('reply_to_mismatch'):
+        score += 20
+        reasons.append('Reply-To domain differs from From domain (response hijacking)')
+    
+    if sender.get('return_path_mismatch'):
+        score += 10
+        reasons.append('Return-Path domain differs from From domain')
+    
+    if sender.get('suspicious_sender_tld'):
+        score += 10
+        reasons.append(f"Sender uses high-risk TLD: {sender['suspicious_sender_tld']}")
+    
+    # ── URL analysis ─────────────────────────────────────────────────────
+    url_risks = analysis.get('url_analysis', {}).get('risky_urls', [])
+    for url_result in url_risks:
+        url_score = url_result.get('risk_score', 0)
+        if url_score >= 25:
+            score += min(url_score // 2, 20)
+            flags = ', '.join(url_result['flags'][:2])
+            reasons.append(f"Risky URL ({url_result.get('domain', 'unknown')}): {flags}")
+    
+    misleading = analysis.get('url_analysis', {}).get('misleading_links', [])
+    if misleading:
+        score += 25
+        reasons.append(f'{len(misleading)} misleading link(s) — visible text differs from actual URL')
+    
+    # ── Subject line ─────────────────────────────────────────────────────
+    subject_flags = analysis.get('subject_analysis', {}).get('flags', [])
+    if subject_flags:
+        score += min(len(subject_flags) * 5, 15)
+        reasons.append(f"Suspicious subject: {len(subject_flags)} flag(s)")
+    
+    # ── Body content ─────────────────────────────────────────────────────
+    body = analysis.get('body_analysis', {})
+    urgency_count = len(body.get('urgency_hits', []))
+    cred_count = len(body.get('credential_hits', []))
+    
+    if urgency_count > 0:
+        score += min(urgency_count * 3, 12)
+        reasons.append(f'{urgency_count} urgency keyword(s) in body')
+    
+    if cred_count > 0:
+        score += min(cred_count * 4, 15)
+        reasons.append(f'{cred_count} credential-harvesting keyword(s) in body')
+    
+    if body.get('has_forms') and body.get('password_fields', 0) > 0:
+        score += 20
+        reasons.append(f"HTML form with password input field(s) — credential harvester")
+    
+    # ── Attachments ──────────────────────────────────────────────────────
+    for att in analysis.get('attachments', []):
+        if att.get('dangerous'):
+            score += 20
+            reasons.append(f"Dangerous attachment: {att['filename']} ({att['extension']})")
+    
+    # ── Routing anomalies ────────────────────────────────────────────────
+    routing = analysis.get('routing_analysis', {})
+    if routing.get('suspicious_hop_count'):
+        score += 5
+        reasons.append(f"Unusual routing: {routing['hop_count']} hops (>8 is suspicious)")
+    
+    score = min(score, 100)
+    
+    if score >= 75:   verdict = 'HIGH RISK — Likely Phishing'
+    elif score >= 50: verdict = 'MEDIUM RISK — Suspicious Email'
+    elif score >= 25: verdict = 'LOW-MEDIUM RISK — Some Suspicious Indicators'
+    else:             verdict = 'LOW RISK — Likely Legitimate'
+    
+    return score, verdict, reasons
+
+
+# ── Main Analysis Orchestrator ────────────────────────────────────────────────
+
+def analyze_email(filepath: str) -> dict:
+    """Run the complete phishing analysis pipeline."""
+    
+    print(f'\n{"="*60}')
+    print(f'  PHISHING EMAIL DETECTOR')
+    print(f'{"="*60}')
+    print(f'  File: {filepath}')
+    print(f'  Time: {datetime.datetime.utcnow().isoformat()} UTC')
+    print(f'{"="*60}\n')
+    
+    # Parse email
+    print('[*] Parsing email file...')
+    msg = parse_email_file(filepath)
+    
+    analysis = {
+        'metadata': {
+            'filepath': filepath,
+            'filename': os.path.basename(filepath),
+            'analysis_time': datetime.datetime.utcnow().isoformat() + 'Z',
+        }
+    }
+    
+    # Basic headers
+    analysis['metadata']['subject'] = decode_email_header(msg.get('Subject', ''))
+    analysis['metadata']['date'] = msg.get('Date', '')
+    analysis['metadata']['message_id'] = msg.get('Message-ID', '')
+    print(f"    Subject: {analysis['metadata']['subject']}")
+    print(f"    Date:    {analysis['metadata']['date']}")
+    
+    # Extract body and attachments
+    print('[*] Extracting email body and attachments...')
+    body = extract_email_body(msg)
+    analysis['attachments'] = extract_attachments(msg)
+    dangerous_att = [a for a in analysis['attachments'] if a['dangerous']]
+    print(f"    Body: {len(body['plain'])} chars plain, {len(body['html'])} chars HTML")
+    print(f"    Attachments: {len(analysis['attachments'])} total, {len(dangerous_att)} dangerous")
+    
+    # Sender analysis
+    print('[*] Analyzing sender headers...')
+    analysis['sender_analysis'] = analyze_sender(msg)
+    sa = analysis['sender_analysis']
+    print(f"    From: {sa.get('from_email')}")
+    print(f"    Domain: {sa.get('from_domain')}")
+    if sa.get('impersonation_flags'):
+        print(f"    ⚠️  Impersonation flags: {len(sa['impersonation_flags'])}")
+    if sa.get('reply_to_mismatch'):
+        print(f"    ⚠️  Reply-To mismatch detected")
+    
+    # Authentication
+    print('[*] Checking authentication headers (SPF/DKIM/DMARC)...')
+    analysis['authentication'] = analyze_authentication_headers(msg)
+    auth = analysis['authentication']
+    for check in ['spf', 'dkim', 'dmarc']:
+        result = auth[check]['result']
+        status = '✅' if result == 'pass' else '⚠️ ' if result == 'not_found' else '❌'
+        print(f"    {status} {check.upper()}: {result}")
+    
+    # Routing
+    print('[*] Tracing routing headers...')
+    analysis['routing_analysis'] = analyze_routing_headers(msg)
+    routing = analysis['routing_analysis']
+    print(f"    {routing['hop_count']} hops. Originating IP: {routing.get('originating_ip', 'unknown')}")
+    
+    # Subject
+    print('[*] Analyzing subject line...')
+    analysis['subject_analysis'] = analyze_subject(analysis['metadata']['subject'])
+    sub_flags = analysis['subject_analysis']['flags']
+    if sub_flags:
+        print(f"    ⚠️  {len(sub_flags)} suspicious pattern(s)")
+    else:
+        print(f"    ✅ No suspicious patterns")
+    
+    # URL analysis
+    print('[*] Extracting and analyzing URLs...')
+    all_urls = extract_urls_from_html(body['html'])
+    all_urls += re.findall(r'https?://[^\s\'"<>]+', body['plain'])
+    all_urls = list(set(all_urls))
+    
+    url_results = [analyze_url(url) for url in all_urls[:50]]  # cap at 50
+    risky_urls = [u for u in url_results if u['risk_score'] >= 15]
+    misleading = detect_misleading_links(body['html'])
+    
+    analysis['url_analysis'] = {
+        'total_urls': len(all_urls),
+        'risky_urls': risky_urls,
+        'misleading_links': misleading,
+        'url_shorteners': [u['url'] for u in url_results if any('shortener' in f for f in u['flags'])],
+    }
+    print(f"    {len(all_urls)} URLs found. {len(risky_urls)} risky. {len(misleading)} misleading links.")
+    
+    # Body content analysis
+    print('[*] Analyzing body content...')
+    analysis['body_analysis'] = analyze_body_content(body['plain'], body['html'])
+    ba = analysis['body_analysis']
+    print(f"    Urgency keywords: {len(ba.get('urgency_hits', []))}")
+    print(f"    Credential keywords: {len(ba.get('credential_hits', []))}")
+    if ba.get('has_forms'):
+        print(f"    ⚠️  HTML forms detected: {ba.get('form_count')} form(s), {ba.get('password_fields', 0)} password field(s)")
+    
+    # Risk scoring
+    print('\n[*] Calculating phishing risk score...')
+    score, verdict, reasons = calculate_phishing_score(analysis)
+    analysis['risk_assessment'] = {
+        'score':   score,
+        'verdict': verdict,
+        'reasons': reasons,
+    }
+    
+    return analysis
+
+
+def print_phishing_summary(analysis: dict):
+    """Print a clean analysis summary."""
+    risk = analysis['risk_assessment']
+    
+    print(f'\n{"="*60}')
+    print(f'  PHISHING ANALYSIS SUMMARY')
+    print(f'{"="*60}')
+    print(f"  File:    {analysis['metadata']['filename']}")
+    print(f"  Subject: {analysis['metadata']['subject'][:60]}")
+    print(f'\n  RISK SCORE: {risk["score"]}/100')
+    print(f'  VERDICT:    {risk["verdict"]}')
+    print(f'\n  Evidence:')
+    for reason in risk['reasons']:
+        print(f'    • {reason}')
+    print(f'{"="*60}\n')
+
+
+# ── CLI Entry Point ───────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Phishing Email Detector',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python phishing_detector.py suspicious.eml
+  python phishing_detector.py email.eml --output report.json
+  python phishing_detector.py *.eml --batch
+        """
+    )
+    parser.add_argument('filepath', help='Path to .eml email file')
+    parser.add_argument('--output', '-o', help='Save JSON report to this file')
+    parser.add_argument('--batch', action='store_true', help='Analyze all .eml files in directory')
+    
+    args = parser.parse_args()
+    
+    if args.batch:
+        path = Path(args.filepath)
+        if path.is_dir():
+            eml_files = list(path.glob('*.eml'))
+            print(f'[*] Batch mode: {len(eml_files)} .eml files found')
+            for eml_file in eml_files:
+                analysis = analyze_email(str(eml_file))
+                print_phishing_summary(analysis)
+            return
+    
+    analysis = analyze_email(args.filepath)
+    print_phishing_summary(analysis)
+    
+    if args.output:
+        with open(args.output, 'w') as f:
+            json.dump(analysis, f, indent=2, default=str)
+        print(f'[+] Report saved: {args.output}')
+    else:
+        print(json.dumps(analysis, indent=2, default=str))
+
+
+if __name__ == '__main__':
+    main()
