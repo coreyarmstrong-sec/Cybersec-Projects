@@ -1,0 +1,92 @@
+# 🎣 Phishing Email Detector
+
+A multi-layer analysis engine for detecting phishing emails from `.eml` files. No external API required for core functionality.
+
+## What It Analyzes
+
+| Layer | What It Detects |
+|---|---|
+| **Sender Analysis** | Display name spoofing, domain lookalikes, Reply-To hijacking, Return-Path mismatch |
+| **Authentication (SPF/DKIM/DMARC)** | Email authentication failures — the most reliable phishing signal |
+| **URL Inspection** | IP-based URLs, URL shorteners, suspicious TLDs, misleading links, brand-in-subdomain |
+| **Subject Analysis** | Urgency patterns, excessive punctuation, spoofed reply chains |
+| **Body Content** | Urgency keywords, credential harvesting language, hidden forms, password fields |
+| **Attachment Check** | Flags dangerous extensions (.exe, .js, .docm, macro files, etc.) |
+| **Routing Analysis** | Traces hop chain, detects IP-only senders, unusual routing paths |
+| **Risk Scoring** | Evidence-weighted 0–100 score with full reasoning |
+
+## Installation
+
+```bash
+# No dependencies required — uses only Python stdlib
+python phishing_detector.py suspicious.eml
+
+# Optional: install requests for future VT integration
+pip install requests
+```
+
+## Usage
+
+```bash
+# Analyze a single email
+python phishing_detector.py suspicious.eml
+
+# Save report to JSON
+python phishing_detector.py email.eml --output report.json
+
+# Batch analyze a directory
+python phishing_detector.py ./email_samples/ --batch
+```
+
+## How to Get .eml Files
+
+| Email Client | How to Export |
+|---|---|
+| **Gmail** | More → Download Message |
+| **Outlook** | File → Save As → .msg (convert with `msgconvert` to .eml) |
+| **Thunderbird** | Save As → .eml |
+| **Command line** | `curl -u user:pass imaps://mail.example.com/INBOX/1 > email.eml` |
+
+## Sample Output
+
+```
+============================================================
+  PHISHING ANALYSIS SUMMARY
+============================================================
+  File:    phish_paypal.eml
+  Subject: URGENT: Your PayPal account has been limited!
+
+  RISK SCORE: 87/100
+  VERDICT:    HIGH RISK — Likely Phishing
+
+  Evidence:
+    • SPF FAIL — sender may not be who they claim
+    • DKIM not configured on sender domain
+    • Display name spoof: claims to be 'PayPal Security' but sent from updates.srv-notify.xyz
+    • Reply-To domain differs from From domain (response hijacking)
+    • Risky URL (account-verify.xyz): IP address used instead of domain
+    • 2 misleading link(s) — visible text differs from actual URL
+    • HTML form with password input field(s) — credential harvester
+    • 6 urgency keyword(s) in body
+============================================================
+```
+
+## Key Concepts to Study
+
+- **SPF (Sender Policy Framework)** — DNS TXT records declaring authorized sending servers. `spf=fail` means the email came from an unauthorized server.
+- **DKIM (DomainKeys Identified Mail)** — Cryptographic signature in email headers. Validates message integrity and sender identity.
+- **DMARC** — Policy layer on top of SPF/DKIM. Tells receivers what to do when checks fail (none/quarantine/reject).
+- **Email Header Analysis** — Learn to read raw headers. The `Received:` chain tells you where an email really came from.
+- **Homograph Attacks** — Unicode lookalike characters (е vs e, а vs a) in domains.
+
+## Extending This Project
+
+- Add integration with [PhishTank API](https://phishtank.org) for URL reputation
+- Add Unicode/Punycode homograph detection
+- Build a bulk training dataset and train a machine learning classifier
+- Create a real-time Gmail/Outlook plugin using IMAP
+- Add WHOIS lookups to check domain registration age (new domains = higher risk)
+
+## Skills Demonstrated
+
+`Email Security` `SPF/DKIM/DMARC` `URL Analysis` `Social Engineering Detection` `Python` `Threat Intel` `SOC Analysis`
