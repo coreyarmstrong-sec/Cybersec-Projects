@@ -1,0 +1,128 @@
+# 🌐 Network Traffic Analyzer
+
+Packet capture and analysis tool for detecting network-based threats. Supports both live interface sniffing and offline PCAP file analysis.
+
+## What It Detects
+
+| Threat | Detection Method |
+|---|---|
+| **Port Scanning** | Tracks unique ports per source/destination pair (>15 ports = alert) |
+| **SYN Flood (DoS)** | Counts SYN packets to same destination within 10-second windows |
+| **ARP Spoofing / MitM** | Flags when multiple MACs claim the same IP address |
+| **DNS Tunneling** | Detects unusually long query names (>52 chars with long subdomains) |
+| **DNS Amplification** | Alerts on DNS ANY queries (used in DDoS amplification) |
+| **DNS Beaconing** | Flags domains queried 50+ times (C2 check-in behavior) |
+| **Suspicious Ports** | Known backdoor, C2, and RAT ports (4444, 31337, 9050, etc.) |
+| **Plaintext Protocols** | Alerts on Telnet, credentials in HTTP GET parameters |
+| **Data Exfiltration** | Flags hosts sending >100MB to non-private IP ranges |
+| **ICMP Tunneling** | Oversized ICMP payloads (>64 bytes) used to tunnel data |
+| **Suspicious User Agents** | Curl, wget, blank UAs indicating scripted/malware traffic |
+
+## Installation
+
+```bash
+pip install scapy
+# For live capture on Linux:
+sudo pip install scapy
+```
+
+## Usage
+
+```bash
+# Analyze a PCAP file (no root needed)
+python network_analyzer.py --pcap capture.pcap
+
+# Live capture for 60 seconds
+sudo python network_analyzer.py --interface eth0 --duration 60
+
+# Capture with BPF filter + save to PCAP
+sudo python network_analyzer.py --interface eth0 --duration 120 \
+  --filter "not port 443" --output capture.pcap
+
+# Save analysis to JSON
+python network_analyzer.py --pcap capture.pcap --output-json report.json
+```
+
+## BPF Filter Reference
+
+```bash
+"host 192.168.1.1"          # Traffic to/from specific IP
+"port 80 or port 443"       # HTTP + HTTPS only
+"tcp and dst port 22"       # Inbound SSH only
+"not (port 80 or port 443)" # Exclude common web traffic
+"src net 10.0.0.0/8"        # From private 10.x.x.x range
+"greater 1000"              # Packets larger than 1000 bytes
+```
+
+## Sample Output
+
+```
+============================================================
+  NETWORK ANALYSIS REPORT
+============================================================
+
+  📊 CAPTURE SUMMARY
+     Total Packets:  45,232
+     Duration:       60.0s
+     Packets/sec:    753.9
+
+  📡 PROTOCOL BREAKDOWN
+     TCP       : 38,441
+     UDP       : 5,891
+     ICMP      : 900
+
+  🚨 ALERTS (5 total)
+     🔴 CRITICAL   : 1
+     🟠 HIGH       : 2
+     🟡 MEDIUM     : 2
+
+  🚨 DETAILED ALERTS
+     [CRITICAL] ARP_SPOOFING: ARP conflict for 192.168.1.1: multiple MACs
+     [HIGH] PORT_SCAN: 192.168.1.105 → 192.168.1.50: scanned 23+ ports
+     [HIGH] DNS_TUNNEL: Possible DNS tunneling from 10.0.0.4: query 87 chars
+     [MEDIUM] SUSPICIOUS_PORT: 10.0.0.12 → 23.45.67.89:4444 — Metasploit default
+============================================================
+```
+
+## Get Sample PCAPs to Practice With
+
+| Source | URL |
+|---|---|
+| **Malware Traffic Analysis** | https://www.malware-traffic-analysis.net/ |
+| **PacketLife** | https://packetlife.net/captures/ |
+| **Wireshark Sample Captures** | https://wiki.wireshark.org/SampleCaptures |
+| **PCAP Repo (GitHub)** | https://github.com/chrissanders/packets |
+
+## Key Concepts to Study
+
+- **BPF (Berkeley Packet Filter)** — The filtering language used by Wireshark, tcpdump, and this tool. Learn it: `man pcap-filter`
+- **Scapy** — Python packet manipulation library. Also used for crafting custom packets for pentesting.
+- **TCP Three-Way Handshake** — SYN → SYN-ACK → ACK. Port scans send SYN and look at responses to map open ports.
+- **ARP Spoofing** — Attacker broadcasts fake ARP replies to redirect LAN traffic through them (MitM). Countered by Dynamic ARP Inspection (DAI) on managed switches.
+- **DNS Tunneling** — Data exfiltration via DNS queries. Tools: `iodine`, `dns2tcp`. Detection: query length and volume.
+
+## Extending This Project
+
+- Add `GeoIP` lookups to map IPs to countries (`pip install geoip2`)
+- Integrate with your **Splunk homelab** — forward alerts via syslog
+- Add a **SQLite database** to store sessions and build a traffic baseline
+- Implement **Zeek script integration** for advanced protocol analysis
+- Build a **Flask dashboard** to visualize traffic in real-time
+- Add **signature-based detection** using Suricata rule format
+
+## Homelab Integration
+
+This tool pairs perfectly with your homelab setup:
+```bash
+# On pfSense: mirror traffic to analyzer via SPAN port
+# On Proxmox: capture VM traffic with:
+sudo python network_analyzer.py --interface vmbr0 --duration 300 \
+  --output homelab_capture.pcap
+
+# Forward alerts to Splunk HEC:
+# (add alert webhook functionality to push JSON to Splunk HTTP Event Collector)
+```
+
+## Skills Demonstrated
+
+`Network Forensics` `Packet Analysis` `Scapy` `IDS/IPS Logic` `TCP/IP` `DNS Analysis` `ARP` `Threat Detection` `Python`
