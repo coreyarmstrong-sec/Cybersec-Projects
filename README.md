@@ -1,7 +1,3 @@
-# Cybersec-Projects
-My cybersecurity projects with the help of Anthropic Claude ai.
-
-
 # 🔐 Cybersecurity Projects Portfolio
 
 A collection of hands-on cybersecurity tools demonstrating core SOC analyst and security engineer competencies. Built to showcase practical skills in malware analysis, phishing detection, and network forensics.
@@ -12,29 +8,29 @@ A collection of hands-on cybersecurity tools demonstrating core SOC analyst and 
 
 | # | Project | Description | Skills Shown |
 |---|---|---|---|
-| 1 | [🔬 Malware Sandbox](./malware-sandbox/) | Static file analysis — hashes, entropy, PE headers, YARA, VirusTotal | Malware RE, YARA, Threat Intel |
-| 2 | [🎣 Phishing Detector](./phishing-detector/) | Email analysis — SPF/DKIM/DMARC, URL inspection, content scoring | Email Security, SOC Analysis |
-| 3 | [🌐 Network Analyzer](./network-analyzer/) | Packet capture — port scan, ARP spoofing, DNS tunneling detection | Network Forensics, IDS Logic |
+| 1 | [🔬 Malware Analysis Sandbox](./Malware%20Analysis%20Sandbox/) | Static file analysis — hashes, entropy, PE headers, YARA, VirusTotal | Malware RE, YARA, Threat Intel |
+| 2 | [🎣 Phishing Detector](./Phishing%20Detector/) | Email analysis — SPF/DKIM/DMARC, URL inspection, content scoring | Email Security, SOC Analysis |
+| 3 | [🌐 Network Traffic Analyzer](./Network%20Traffic%20Analyzer/) | Packet capture — port scan, ARP spoofing, DNS tunneling detection | Network Forensics, IDS Logic |
 
 ---
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/saint-sec/cybersec-projects
-cd cybersec-projects
+git clone https://github.com/coreyarmstrong-sec/Cybersec-Projects
+cd Cybersec-Projects
 
 # Project 1: Malware Sandbox
-cd malware-sandbox
-pip install pefile yara-python requests    # optional but recommended
+cd "Malware Analysis Sandbox"
+pip install pefile yara-python requests
 python malware_sandbox.py sample.exe
 
 # Project 2: Phishing Detector
-cd ../phishing-detector
+cd "../Phishing Detector"
 python phishing_detector.py suspicious.eml
 
 # Project 3: Network Analyzer
-cd ../network-analyzer
+cd "../Network Traffic Analyzer"
 pip install scapy
 python network_analyzer.py --pcap capture.pcap
 # OR live: sudo python network_analyzer.py --interface eth0 --duration 60
